@@ -1,0 +1,18 @@
+llm:
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+  api_key: "sk-4599ae533b7441598ef45b1d0e6b1659"
+  temperature: 0.2
+  max_tokens: 512
+  timeout_seconds: 60.0
+  max_phrases: 3
+
+thresholds:
+  merge: 0.80
+  novel: 0.52
+  agreement: 0.67
+  uncertain_top1: 0.45
+  uncertain_margin: 0.15
+
+sampling:
+  multi_sample_k: 3
