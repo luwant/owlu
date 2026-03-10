@@ -1,0 +1,12 @@
+owlu/configs/owlu.yaml
+# Ignore local config files
+**/configs/*.yaml
+**/configs/*.yml
+owlu/__pycache__/__init__.cpython-39.pyc
+owlu/__pycache__/label_bank.cpython-39.pyc
+owlu/__pycache__/llm_phrase_generator.cpython-39.pyc
+owlu/__pycache__/ltc_sync.cpython-39.pyc
+owlu/__pycache__/ood_eval.cpython-39.pyc
+owlu/__pycache__/semantic_matcher.cpython-39.pyc
+owlu/__pycache__/task3_eval.cpython-39.pyc
+owlu/__pycache__/task3_sqlite.cpython-39.pyc
