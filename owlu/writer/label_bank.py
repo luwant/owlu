@@ -1,55 +1,21 @@
-﻿"""Task 2 LabelBank: cross-document accumulation and promotion decisions."""
+"""Cross-document label accumulation and promotion decisions.
+
+Migrated from the original top-level label_bank.py — logic is unchanged.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal
-
-from .llm_phrase_generator import CandidatePhrase
-from .semantic_matcher import MatchResult
-
-
-ClusterState = Literal["hold", "candidate", "promoted"]
-
-
-@dataclass
-class LabelInfo:
-    """Mutable label metadata maintained by LabelBank."""
-
-    label_id: str
-    aliases: set[str] = field(default_factory=set)
-    description: str = ""
-
-
-@dataclass
-class ProtoLabelCluster:
-    """Cluster-level aggregation for candidate/hold tracking."""
-
-    cluster_id: str
-    representative_phrase: str
-    phrases: dict[str, int] = field(default_factory=dict)
-    source_docs: set[str] = field(default_factory=set)
-    evidence_docs: set[str] = field(default_factory=set)
-    freq: int = 0
-    agreement_sum: float = 0.0
-    agreement_count: int = 0
-    nearest_label_id: str | None = None
-    nearest_label_distance: float | None = None
-    state: ClusterState = "hold"
-
-    @property
-    def agreement(self) -> float:
-        if self.agreement_count == 0:
-            return 0.0
-        return self.agreement_sum / float(self.agreement_count)
-
-    @property
-    def source_doc_count(self) -> int:
-        return len(self.source_docs)
+from ..common.types import (
+    CandidatePhrase,
+    ClusterState,
+    LabelInfo,
+    MatchResult,
+    ProtoLabelCluster,
+)
 
 
 class LabelBank:
-    """In-memory label bank for Task 2 decisions and audit packaging."""
+    """In-memory label bank for cross-document accumulation and audit packaging."""
 
     def __init__(self, min_freq: int = 3, min_source_docs: int = 2):
         self.min_freq = int(min_freq)
@@ -61,11 +27,19 @@ class LabelBank:
         self.hold_pool: dict[str, ProtoLabelCluster] = {}
         self.promoted_labels: dict[str, ProtoLabelCluster] = {}
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _normalize_phrase(self, text: str) -> str:
         return " ".join((text or "").lower().split())
 
     def _cluster_id(self, phrase_text: str) -> str:
         return self._normalize_phrase(phrase_text)
+
+    # ------------------------------------------------------------------
+    # Label registration
+    # ------------------------------------------------------------------
 
     def register_label(
         self,
@@ -92,9 +66,13 @@ class LabelBank:
         if description:
             info.description = description.strip()
 
-    def add_alias(self, label_id: str, phrase: str, description: str | None = None) -> None:
+    def add_alias(
+        self, label_id: str, phrase: str, description: str | None = None
+    ) -> None:
         if label_id not in self.labels:
-            self.register_label(label_id=label_id, canonical_text=phrase, description=description)
+            self.register_label(
+                label_id=label_id, canonical_text=phrase, description=description
+            )
             return
 
         normalized = self._normalize_phrase(phrase)
@@ -117,6 +95,10 @@ class LabelBank:
         info = self.labels.get(label_id)
         return "" if info is None else info.description
 
+    # ------------------------------------------------------------------
+    # Cluster management
+    # ------------------------------------------------------------------
+
     def _upsert_cluster(
         self,
         phrase: CandidatePhrase,
@@ -130,7 +112,9 @@ class LabelBank:
 
         cluster = self.proto_label_clusters.get(cid)
         if cluster is None:
-            cluster = ProtoLabelCluster(cluster_id=cid, representative_phrase=normalized_phrase)
+            cluster = ProtoLabelCluster(
+                cluster_id=cid, representative_phrase=normalized_phrase
+            )
             self.proto_label_clusters[cid] = cluster
 
         cluster.freq += 1
@@ -141,7 +125,9 @@ class LabelBank:
             cluster.evidence_docs.add(phrase.source_doc_id)
 
         if normalized_phrase:
-            cluster.phrases[normalized_phrase] = cluster.phrases.get(normalized_phrase, 0) + 1
+            cluster.phrases[normalized_phrase] = (
+                cluster.phrases.get(normalized_phrase, 0) + 1
+            )
 
         if cluster.phrases:
             cluster.representative_phrase = max(
@@ -155,7 +141,9 @@ class LabelBank:
             if cluster.nearest_label_distance is None:
                 cluster.nearest_label_distance = float(nearest_label_distance)
             else:
-                cluster.nearest_label_distance = min(cluster.nearest_label_distance, float(nearest_label_distance))
+                cluster.nearest_label_distance = min(
+                    cluster.nearest_label_distance, float(nearest_label_distance)
+                )
 
         return cluster
 
@@ -174,7 +162,10 @@ class LabelBank:
             nearest_label_distance=nearest_label_distance,
         )
 
-        if cluster.freq >= self.min_freq and cluster.source_doc_count >= self.min_source_docs:
+        if (
+            cluster.freq >= self.min_freq
+            and cluster.source_doc_count >= self.min_source_docs
+        ):
             cluster.state = "candidate"
             self.candidate_labels[cluster.cluster_id] = cluster
             self.hold_pool.pop(cluster.cluster_id, None)
@@ -204,6 +195,10 @@ class LabelBank:
         self.candidate_labels.pop(cluster.cluster_id, None)
         return "hold"
 
+    # ------------------------------------------------------------------
+    # Match result routing
+    # ------------------------------------------------------------------
+
     def process_match_result(self, result: MatchResult) -> str:
         phrase = result.phrase
         if result.action == "merge_pre" and result.target_label:
@@ -228,6 +223,10 @@ class LabelBank:
                 nearest_label_distance=nearest_distance,
             )
         return "discard"
+
+    # ------------------------------------------------------------------
+    # Query & review
+    # ------------------------------------------------------------------
 
     def get_hold_cluster(self, cluster_id: str) -> ProtoLabelCluster | None:
         return self.hold_pool.get(cluster_id)
@@ -257,6 +256,10 @@ class LabelBank:
             "agreement": summary["agreement"],
         }
 
+    # ------------------------------------------------------------------
+    # Promotion
+    # ------------------------------------------------------------------
+
     def promote_cluster(self, cluster_id: str, new_label_id: str) -> None:
         cluster = self.proto_label_clusters.get(cluster_id)
         if cluster is None:
@@ -268,7 +271,11 @@ class LabelBank:
         self.promoted_labels[new_label_id] = cluster
 
         aliases = sorted(cluster.phrases.keys())
-        canonical = cluster.representative_phrase if cluster.representative_phrase else new_label_id
+        canonical = (
+            cluster.representative_phrase
+            if cluster.representative_phrase
+            else new_label_id
+        )
         self.register_label(
             label_id=new_label_id,
             canonical_text=canonical,

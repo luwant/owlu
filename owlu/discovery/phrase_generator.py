@@ -1,15 +1,14 @@
-"""Task 1 OWLU LLM phrase generation with DeepSeek-compatible API."""
+"""LLM-based phrase extraction using DeepSeek-compatible API."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
-import yaml
+from ..common.types import CandidatePhrase, OWLUConfig
 
 
 class LLMOutputError(ValueError):
@@ -17,70 +16,10 @@ class LLMOutputError(ValueError):
 
 
 def get_api_key(env_var: str = "DEEPSEEK_API_KEY") -> str:
-    """Get API key from environment and fail fast when missing."""
     api_key = os.getenv(env_var, "").strip()
     if not api_key:
         raise EnvironmentError(f"Missing required environment variable: {env_var}")
     return api_key
-
-
-@dataclass(frozen=True)
-class OWLUConfig:
-    """Config used by Task 1 components."""
-
-    llm_base_url: str
-    llm_model: str
-    llm_api_key: str | None
-    llm_temperature: float
-    llm_max_tokens: int
-    llm_timeout_seconds: float
-    llm_max_phrases: int
-    merge_threshold: float
-    novel_threshold: float
-    agreement_threshold: float
-    uncertain_top1_threshold: float
-    uncertain_margin_threshold: float
-    multi_sample_k: int
-
-    @classmethod
-    def from_yaml(cls, path: str) -> "OWLUConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-
-        llm = raw.get("llm", {})
-        thresholds = raw.get("thresholds", {})
-        sampling = raw.get("sampling", {})
-        return cls(
-            llm_base_url=str(llm.get("base_url", "https://api.deepseek.com")),
-            llm_model=str(llm.get("model", "deepseek-chat")),
-            llm_api_key=(str(llm.get("api_key")).strip() if llm.get("api_key") else None),
-            llm_temperature=float(llm.get("temperature", 0.2)),
-            llm_max_tokens=int(llm.get("max_tokens", 512)),
-            llm_timeout_seconds=float(llm.get("timeout_seconds", 60.0)),
-            llm_max_phrases=int(llm.get("max_phrases", 3)),
-            merge_threshold=float(thresholds.get("merge", 0.80)),
-            novel_threshold=float(thresholds.get("novel", 0.52)),
-            agreement_threshold=float(thresholds.get("agreement", 0.67)),
-            uncertain_top1_threshold=float(thresholds.get("uncertain_top1", 0.45)),
-            uncertain_margin_threshold=float(thresholds.get("uncertain_margin", 0.15)),
-            multi_sample_k=int(sampling.get("multi_sample_k", 3)),
-        )
-
-
-@dataclass
-class CandidatePhrase:
-    """Single phrase candidate produced by LLM."""
-
-    text: str
-    raw_text: str
-    source_doc_id: str
-    timestamp: datetime
-    summary: str | None = None
-    evidence: list[str] | None = None
-    agreement: float = 1.0
-    pass_id: int = 1
-    source_count: int = 1
-    cluster_id: str | None = None
 
 
 class LLMPhraseGenerator:
@@ -91,7 +30,6 @@ class LLMPhraseGenerator:
         self.client = client or self._build_default_client()
 
     def _build_default_client(self) -> Any:
-        # Lazy import keeps tests lightweight and avoids hard dependency for mock-only usage.
         from openai import OpenAI  # type: ignore
 
         api_key = self.config.llm_api_key or get_api_key()
@@ -127,7 +65,6 @@ class LLMPhraseGenerator:
         except json.JSONDecodeError:
             pass
 
-        # Handle fenced output like ```json {...}```
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
             raise LLMOutputError("No JSON object found in LLM response")
@@ -166,13 +103,14 @@ class LLMPhraseGenerator:
         if isinstance(phrases, str):
             phrases = [p.strip() for p in phrases.split(",") if p.strip()]
         if not isinstance(phrases, list):
-            raise LLMOutputError("JSON field 'phrases' must be a list (or comma-separated string)")
+            raise LLMOutputError(
+                "JSON field 'phrases' must be a list (or comma-separated string)"
+            )
         if evidence is None:
             evidence = []
         elif isinstance(evidence, str):
             evidence = [evidence.strip()] if evidence.strip() else []
         elif not isinstance(evidence, list):
-            # Be tolerant to provider formatting drift for live API responses.
             evidence = [str(evidence)]
 
         candidates: list[CandidatePhrase] = []
@@ -189,7 +127,9 @@ class LLMPhraseGenerator:
             seen.add(key)
             if len(candidates) >= self.config.llm_max_phrases:
                 break
-            agreement = 1.0 if agreement_map is None else float(agreement_map.get(key, 0.0))
+            agreement = (
+                1.0 if agreement_map is None else float(agreement_map.get(key, 0.0))
+            )
             candidates.append(
                 CandidatePhrase(
                     text=phrase,
@@ -205,11 +145,19 @@ class LLMPhraseGenerator:
             )
         return candidates
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def generate(self, text: str, doc_id: str) -> list[CandidatePhrase]:
+        """Single-pass phrase extraction."""
         payload = self._request_once(text)
         return self._build_candidates(payload=payload, doc_id=doc_id, pass_id=1)
 
-    def should_trigger_uncertain(self, top1_score: float, top2_score: float) -> bool:
+    def should_trigger_uncertain(
+        self, top1_score: float, top2_score: float
+    ) -> bool:
+        """Decide whether uncertainty-based multi-sampling should kick in."""
         if top1_score < self.config.uncertain_top1_threshold:
             return True
         margin = top1_score - top2_score
@@ -224,10 +172,15 @@ class LLMPhraseGenerator:
         results: list[CandidatePhrase] = []
         for text, doc_id, (top1, top2) in zip(texts, doc_ids, scores):
             if self.should_trigger_uncertain(top1, top2):
-                results.extend(self.multi_sample_aggregate(text=text, doc_id=doc_id))
+                results.extend(
+                    self.multi_sample_aggregate(text=text, doc_id=doc_id)
+                )
         return results
 
-    def multi_sample_aggregate(self, text: str, doc_id: str, k: int | None = None) -> list[CandidatePhrase]:
+    def multi_sample_aggregate(
+        self, text: str, doc_id: str, k: int | None = None
+    ) -> list[CandidatePhrase]:
+        """k-shot sampling with consistency voting."""
         samples = int(k or self.config.multi_sample_k)
         if samples <= 0:
             raise ValueError("k must be > 0")
@@ -242,7 +195,9 @@ class LLMPhraseGenerator:
             if summary is None and isinstance(payload.get("summary"), str):
                 summary = payload["summary"]
             if not evidence and isinstance(payload.get("evidence"), list):
-                evidence = [e for e in payload["evidence"] if isinstance(e, str)]
+                evidence = [
+                    e for e in payload["evidence"] if isinstance(e, str)
+                ]
             phrases = payload.get("phrases", [])
             if not isinstance(phrases, list):
                 continue
@@ -257,15 +212,21 @@ class LLMPhraseGenerator:
                 phrase_raw.setdefault(key, phrase)
 
         if not phrase_votes:
-            raise LLMOutputError("No valid phrases found across multi-sample aggregation")
+            raise LLMOutputError(
+                "No valid phrases found across multi-sample aggregation"
+            )
 
         sorted_keys = sorted(phrase_votes, key=lambda x: (-phrase_votes[x], x))
         top_keys = sorted_keys[: self.config.llm_max_phrases]
-        agreement_map = {key: phrase_votes[key] / float(samples) for key in top_keys}
+        agreement_map = {
+            key: phrase_votes[key] / float(samples) for key in top_keys
+        }
 
         payload = {
             "summary": summary,
             "phrases": [phrase_raw[key] for key in top_keys],
             "evidence": evidence,
         }
-        return self._build_candidates(payload=payload, doc_id=doc_id, pass_id=2, agreement_map=agreement_map)
+        return self._build_candidates(
+            payload=payload, doc_id=doc_id, pass_id=2, agreement_map=agreement_map
+        )
