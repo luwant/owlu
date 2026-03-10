@@ -1,7 +1,7 @@
 llm:
   base_url: "https://api.deepseek.com"
   model: "deepseek-chat"
-  api_key: "sk-4599ae533b7441598ef45b1d0e6b1659"
+  api_key: ""
   temperature: 0.2
   max_tokens: 512
   timeout_seconds: 60.0
