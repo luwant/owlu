@@ -1,15 +1,23 @@
 """Shared scoring, inference, and threshold calibration utilities.
 
 These pure functions are used by both fast_sync and slow_sync.
+
+The module contains two layers:
+    1. Pure-Python (list-based) utilities — for unit tests and lightweight usage.
+    2. Torch-accelerated helpers — for operating on real LTCEModel buffers.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ..common.types import Matrix, ValidationSample, Vector
+
+if TYPE_CHECKING:
+    import torch
+    from torch.utils.data import DataLoader
 
 
 # ---------------------------------------------------------------------------
@@ -173,5 +181,89 @@ def recalibrate_threshold(
                 best_threshold - current_threshold
             ):
                 best_threshold = threshold
+
+    return float(best_threshold)
+
+
+# ---------------------------------------------------------------------------
+# Torch-accelerated helpers (for real LTCEModel buffers)
+# ---------------------------------------------------------------------------
+
+def blend_and_normalize_torch(
+    base: "torch.Tensor", update: "torch.Tensor", eta: float
+) -> "torch.Tensor":
+    """Blend + L2-normalise using torch ops.  Works on 1-D or 2-D tensors."""
+    import torch
+    import torch.nn.functional as F
+
+    merged = (1.0 - eta) * base + eta * update
+    merged = torch.nan_to_num(merged, nan=0.0, posinf=0.0, neginf=0.0)
+    return F.normalize(merged, p=2, dim=-1)
+
+
+def recalibrate_model_threshold(
+    model: object,
+    dataloader: "DataLoader",
+    device: "torch.device",
+    current_threshold: float,
+) -> float:
+    """Grid-search the best Macro-F1 threshold using actual model forward passes.
+
+    Uses sigmoid(logits) as prediction scores — consistent with LTCE training.
+    """
+    import torch
+
+    model.eval()  # type: ignore[union-attr]
+
+    all_logits: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            outputs = model(  # type: ignore[operator]
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_type_ids=batch.get("token_type_ids"),
+                sentence_map=batch.get("sentence_map"),
+                labels=batch["labels"],
+            )
+            all_logits.append(outputs["logits"].cpu())
+            all_labels.append(batch["labels"].cpu())
+
+    if not all_logits:
+        return float(current_threshold)
+
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0).float()
+    probs = torch.sigmoid(logits)
+
+    num_labels = probs.shape[1]
+    grid = [round(0.10 + i * 0.02, 2) for i in range(41)]
+
+    best_threshold = float(current_threshold)
+    best_score = -1.0
+
+    for th in grid:
+        preds = (probs >= th).float()
+        per_label_f1: list[float] = []
+        for j in range(num_labels):
+            tp = (preds[:, j] * labels[:, j]).sum().item()
+            fp = (preds[:, j] * (1.0 - labels[:, j])).sum().item()
+            fn = ((1.0 - preds[:, j]) * labels[:, j]).sum().item()
+            denom = 2.0 * tp + fp + fn
+            per_label_f1.append((2.0 * tp / denom) if denom > 0.0 else 0.0)
+
+        macro_f1 = sum(per_label_f1) / float(len(per_label_f1))
+
+        if macro_f1 > best_score + 1e-12:
+            best_score = macro_f1
+            best_threshold = th
+        elif abs(macro_f1 - best_score) <= 1e-12:
+            if abs(th - current_threshold) < abs(best_threshold - current_threshold):
+                best_threshold = th
 
     return float(best_threshold)

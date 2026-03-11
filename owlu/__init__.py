@@ -39,7 +39,7 @@ from .common.encoder import BertEncoder, SentenceTransformerEncoder  # noqa: F40
 
 # === Module 3: Prototype Absorption ===
 from .absorption import PrototypeAbsorption  # noqa: F401
-from .absorption.fast_sync import fast_sync  # noqa: F401
+from .absorption.fast_sync import fast_sync, fast_sync_model  # noqa: F401
 from .absorption.slow_sync import slow_sync  # noqa: F401
 from .absorption.metrics import (  # noqa: F401
     normalize,
@@ -49,5 +49,7 @@ from .absorption.metrics import (  # noqa: F401
     infer_above_threshold,
     recalibrate_threshold,
     default_text_encoder,
+    blend_and_normalize_torch,
+    recalibrate_model_threshold,
 )
 

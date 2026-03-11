@@ -2,11 +2,19 @@
 
 Updates E and P by blending alias text embeddings while keeping
 the label count (dimensionality) stable.
+
+Two entry points:
+    fast_sync       — pure-Python, operates on model_state dict.
+    fast_sync_model — torch-native, operates on LTCEModel registered buffers.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
+
+if TYPE_CHECKING:
+    import torch
+    from torch.utils.data import DataLoader
 
 from ..common.types import Matrix, ValidationSample, Vector
 from ..writer.label_bank import LabelBank
@@ -119,3 +127,125 @@ def fast_sync(
         "dim": dim,
     }
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Model-native variant — operates on LTCEModel registered buffers
+# ---------------------------------------------------------------------------
+
+def fast_sync_model(
+    model: object,
+    label_bank: "LabelBank",
+    label_ids: Sequence[str],
+    *,
+    eta_e: float = 0.2,
+    eta_p: float = 0.1,
+    validation_loader: "DataLoader | None" = None,
+    current_threshold: float = 0.45,
+    text_encoder: Callable[[str, int], "Vector"] | None = None,
+    device: "torch.device | None" = None,
+) -> dict[str, object]:
+    """Semantic-only refresh operating directly on LTCEModel registered buffers.
+
+    In-place updates ``model.label_embeddings`` and ``model.label_prototypes``.
+    Threshold is recalibrated using actual model forward passes when
+    *validation_loader* is provided.
+
+    Parameters
+    ----------
+    model : LTCEModel
+        A loaded LTCE model with initialised label_embeddings / label_prototypes.
+    label_bank : LabelBank
+        Label bank containing the latest alias information.
+    label_ids : Sequence[str]
+        Ordered label names corresponding to model rows (dim-0 of E / P).
+    eta_e : float
+        Embedding blend weight (0 = keep original, 1 = full alias embedding).
+    eta_p : float
+        Prototype blend weight.
+    validation_loader : DataLoader | None
+        If given, used for Macro-F1 grid-search threshold recalibration.
+    current_threshold : float
+        The current decision threshold (sigmoid space).
+    text_encoder : Callable | None
+        ``(text, dim) -> Vector``.  Falls back to ``default_text_encoder``.
+    device : torch.device | None
+        Inferred from model parameters when ``None``.
+
+    Returns
+    -------
+    dict with keys: ``threshold``, ``sync_report``.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from .metrics import (
+        blend_and_normalize_torch,
+        default_text_encoder,
+        recalibrate_model_threshold,
+    )
+
+    if not (0.0 <= eta_e <= 1.0):
+        raise ValueError("eta_e must be in [0, 1]")
+    if not (0.0 <= eta_p <= 1.0):
+        raise ValueError("eta_p must be in [0, 1]")
+
+    E: torch.Tensor = model.label_embeddings  # type: ignore[union-attr]
+    P: torch.Tensor = model.label_prototypes   # type: ignore[union-attr]
+    num_labels, dim = E.shape
+
+    if len(label_ids) != num_labels:
+        raise ValueError(
+            f"label_ids length ({len(label_ids)}) != model num_labels ({num_labels})"
+        )
+
+    if device is None:
+        device = E.device
+    encode = text_encoder or default_text_encoder
+
+    label_aliases: dict[str, list[str]] = {}
+
+    with torch.no_grad():
+        for idx, label_id in enumerate(label_ids):
+            semantic_texts = _resolve_label_semantic_text(label_id, label_bank)
+            alias_vecs = [encode(text, dim) for text in semantic_texts]
+
+            # Average alias embeddings → torch tensor
+            alias_tensor = torch.tensor(alias_vecs, dtype=E.dtype, device=device)
+            alias_mean = F.normalize(alias_tensor.mean(dim=0, keepdim=False), p=2, dim=0)
+
+            E[idx] = blend_and_normalize_torch(E[idx], alias_mean, eta=eta_e)
+            P[idx] = blend_and_normalize_torch(P[idx], E[idx],     eta=eta_p)
+
+            label_aliases[label_id] = semantic_texts
+
+    # --- Threshold recalibration ---
+    old_threshold = float(current_threshold)
+    if validation_loader is not None:
+        new_threshold = recalibrate_model_threshold(
+            model, validation_loader, device, old_threshold,
+        )
+    else:
+        new_threshold = old_threshold
+
+    # --- Alignment statistics ---
+    with torch.no_grad():
+        cos = F.cosine_similarity(E, P, dim=-1)
+        avg_alignment = float(cos.mean().item())
+
+    sync_report = {
+        "sync_type": "fast",
+        "eta_e": eta_e,
+        "eta_p": eta_p,
+        "old_threshold": old_threshold,
+        "new_threshold": new_threshold,
+        "avg_embedding_prototype_alignment": avg_alignment,
+        "num_labels": num_labels,
+        "dim": dim,
+    }
+
+    return {
+        "threshold": new_threshold,
+        "label_aliases": label_aliases,
+        "sync_report": sync_report,
+    }

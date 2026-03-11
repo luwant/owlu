@@ -8,18 +8,24 @@ Sub-modules:
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from ..common.types import Matrix, ValidationSample, Vector
 from ..writer.label_bank import LabelBank
-from .fast_sync import fast_sync
+from .fast_sync import fast_sync, fast_sync_model
 from .slow_sync import slow_sync
 from .metrics import (
     score_document,
     infer_topk,
     infer_above_threshold,
     recalibrate_threshold,
+    blend_and_normalize_torch,
+    recalibrate_model_threshold,
 )
+
+if TYPE_CHECKING:
+    import torch
+    from torch.utils.data import DataLoader
 
 
 class PrototypeAbsorption:
@@ -84,4 +90,36 @@ class PrototypeAbsorption:
             eta_e=eta_e,
             eta_p=eta_p,
             text_encoder=self.text_encoder,
+        )
+
+    # ------------------------------------------------------------------
+    # Model-native variant — operates directly on LTCEModel
+    # ------------------------------------------------------------------
+
+    def fast_absorb_model(
+        self,
+        model: object,
+        label_ids: Sequence[str],
+        *,
+        eta_e: float = 0.2,
+        eta_p: float = 0.1,
+        validation_loader: "DataLoader | None" = None,
+        current_threshold: float = 0.45,
+        device: "torch.device | None" = None,
+    ) -> dict[str, object]:
+        """Semantic-only refresh operating on LTCEModel registered buffers.
+
+        In-place updates ``model.label_embeddings`` and ``model.label_prototypes``.
+        Returns ``{"threshold": float, "label_aliases": dict, "sync_report": dict}``.
+        """
+        return fast_sync_model(
+            model=model,
+            label_bank=self.label_bank,
+            label_ids=label_ids,
+            eta_e=eta_e,
+            eta_p=eta_p,
+            validation_loader=validation_loader,
+            current_threshold=current_threshold,
+            text_encoder=self.text_encoder,
+            device=device,
         )
