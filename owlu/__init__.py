@@ -32,6 +32,10 @@ from .discovery.matcher import SemanticMatcher  # noqa: F401
 from .writer import OntologyWriter  # noqa: F401
 from .writer.label_bank import LabelBank  # noqa: F401
 from .writer.constraints import OntologyConstraintChecker, ConstraintViolation  # noqa: F401
+from .writer.persistence import LabelBankStore  # noqa: F401
+
+# === Shared encoder ===
+from .common.encoder import BertEncoder, SentenceTransformerEncoder  # noqa: F401
 
 # === Module 3: Prototype Absorption ===
 from .absorption import PrototypeAbsorption  # noqa: F401

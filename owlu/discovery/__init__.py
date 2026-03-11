@@ -37,6 +37,7 @@ class CandidateDiscovery:
         *,
         llm_client: Any | None = None,
         fixed_threshold: float | None = None,
+        dense_encoder: Any | None = None,
     ):
         self.config = config
         self.label_inventory = dict(label_inventory)
@@ -47,7 +48,7 @@ class CandidateDiscovery:
             fixed_threshold=fixed_threshold,
         )
         self.generator = LLMPhraseGenerator(config, client=llm_client)
-        self.matcher = SemanticMatcher(config)
+        self.matcher = SemanticMatcher(config, dense_encoder=dense_encoder)
 
     # ------------------------------------------------------------------
     # Public API
@@ -134,3 +135,4 @@ class CandidateDiscovery:
     def update_label_inventory(self, label_inventory: Mapping[str, str]) -> None:
         """Hot-update the label inventory after Writer promotes new labels."""
         self.label_inventory = dict(label_inventory)
+        self.matcher.invalidate_label_cache()

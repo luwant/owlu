@@ -5,6 +5,9 @@ Migrated from the original top-level label_bank.py — logic is unchanged.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from ..common.types import (
     CandidatePhrase,
     ClusterState,
@@ -17,9 +20,17 @@ from ..common.types import (
 class LabelBank:
     """In-memory label bank for cross-document accumulation and audit packaging."""
 
-    def __init__(self, min_freq: int = 3, min_source_docs: int = 2):
+    def __init__(
+        self,
+        min_freq: int = 3,
+        min_source_docs: int = 2,
+        min_agreement: float = 0.5,
+        min_semantic_distance: float = 0.3,
+    ):
         self.min_freq = int(min_freq)
         self.min_source_docs = int(min_source_docs)
+        self.min_agreement = float(min_agreement)
+        self.min_semantic_distance = float(min_semantic_distance)
 
         self.labels: dict[str, LabelInfo] = {}
         self.proto_label_clusters: dict[str, ProtoLabelCluster] = {}
@@ -32,10 +43,60 @@ class LabelBank:
     # ------------------------------------------------------------------
 
     def _normalize_phrase(self, text: str) -> str:
-        return " ".join((text or "").lower().split())
+        """Lowercase → remove punctuation → collapse whitespace → merge single chars.
+
+        Examples:
+            "Deep-Learning" → "deep learning"
+            "N.L.P."        → "nlp"
+        """
+        lowered = (text or "").lower()
+        # Remove all punctuation characters (Unicode category P)
+        depuncted = re.sub(
+            r"[^\w\s]",
+            " ",
+            unicodedata.normalize("NFKD", lowered),
+        )
+        tokens = depuncted.split()
+        # Merge runs of single-character tokens (e.g. ["n","l","p"] → ["nlp"])
+        merged: list[str] = []
+        buf: list[str] = []
+        for tok in tokens:
+            if len(tok) == 1 and tok.isalnum():
+                buf.append(tok)
+            else:
+                if buf:
+                    merged.append("".join(buf))
+                    buf = []
+                merged.append(tok)
+        if buf:
+            merged.append("".join(buf))
+        return " ".join(merged)
 
     def _cluster_id(self, phrase_text: str) -> str:
         return self._normalize_phrase(phrase_text)
+
+    def _should_promote(self, cluster: ProtoLabelCluster) -> bool:
+        """Four-gate promotion check (Dawid & Skene + X-MLClass).
+
+        1. freq           >= min_freq            (annotation volume)
+        2. source_docs    >= min_source_docs      (annotator independence)
+        3. agreement      >= min_agreement         (annotator consistency)
+        4. semantic_dist  >= min_semantic_distance  (label-space novelty)
+        """
+        if cluster.freq < self.min_freq:
+            return False
+        if cluster.source_doc_count < self.min_source_docs:
+            return False
+        if cluster.agreement < self.min_agreement:
+            return False
+        effective_distance = (
+            cluster.nearest_label_distance
+            if cluster.nearest_label_distance is not None
+            else 1.0
+        )
+        if effective_distance < self.min_semantic_distance:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Label registration
@@ -162,10 +223,7 @@ class LabelBank:
             nearest_label_distance=nearest_label_distance,
         )
 
-        if (
-            cluster.freq >= self.min_freq
-            and cluster.source_doc_count >= self.min_source_docs
-        ):
+        if self._should_promote(cluster):
             cluster.state = "candidate"
             self.candidate_labels[cluster.cluster_id] = cluster
             self.hold_pool.pop(cluster.cluster_id, None)
