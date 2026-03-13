@@ -3,3 +3,6 @@ owlu/configs/owlu.yaml
 **/configs/*.yaml
 **/configs/*.yml
 Label-gen/
+__pycache__/
+*.py[cod]
+*.sqlite

@@ -140,6 +140,7 @@ class ProtoLabelCluster:
 
     cluster_id: str
     representative_phrase: str
+    centroid_embedding: Vector | None = None
     phrases: dict[str, int] = field(default_factory=dict)
     source_docs: set[str] = field(default_factory=set)
     evidence_docs: set[str] = field(default_factory=set)

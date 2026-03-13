@@ -7,11 +7,12 @@ Sub-modules:
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from ..common.types import (
     CandidatePhrase,
     LabelInfo,
+    LtceTextSample,
     MatchResult,
     ProtoLabelCluster,
 )
@@ -42,6 +43,9 @@ class OntologyWriter:
         min_source_docs: int = 2,
         min_agreement: float = 0.5,
         min_semantic_distance: float = 0.3,
+        dense_encoder: Callable[[str], list[float]] | None = None,
+        cluster_merge_threshold: float = 0.84,
+        cluster_merge_margin: float = 0.04,
         db_path: str | None = None,
     ):
         self.bank = label_bank or LabelBank(
@@ -49,6 +53,9 @@ class OntologyWriter:
             min_source_docs=min_source_docs,
             min_agreement=min_agreement,
             min_semantic_distance=min_semantic_distance,
+            dense_encoder=dense_encoder,
+            cluster_merge_threshold=cluster_merge_threshold,
+            cluster_merge_margin=cluster_merge_margin,
         )
         self.constraints = constraint_checker or OntologyConstraintChecker()
         self._store: LabelBankStore | None = None
@@ -87,11 +94,17 @@ class OntologyWriter:
         cls,
         db_path: str,
         constraint_checker: OntologyConstraintChecker | None = None,
+        dense_encoder: Callable[[str], list[float]] | None = None,
     ) -> "OntologyWriter":
         """Factory: reconstruct an OntologyWriter from a persisted database."""
         store = LabelBankStore(db_path)
         bank = store.load()
-        writer = cls(label_bank=bank, constraint_checker=constraint_checker, db_path=db_path)  # type: ignore[arg-type]
+        bank.dense_encoder = dense_encoder
+        writer = cls(
+            label_bank=bank,
+            constraint_checker=constraint_checker,
+            db_path=db_path,
+        )  # type: ignore[arg-type]
         return writer
 
     # ------------------------------------------------------------------
@@ -104,6 +117,35 @@ class OntologyWriter:
         Returns the resulting action: 'merge', 'candidate', 'hold', or 'discard'.
         """
         action = self.bank.process_match_result(result)
+        self._auto_persist()
+        return action
+
+    def ingest_with_document(
+        self,
+        result: MatchResult,
+        *,
+        document_text: str,
+        source_type: str = "discovery",
+        split: str = "train",
+    ) -> str:
+        """Process a MatchResult and persist the backing document evidence.
+
+        This is the preferred online-update path when the source document should
+        later be available for slow-sync training.
+        """
+        action = self.bank.process_match_result(result)
+        if self._store is not None:
+            self._auto_persist()
+            self._store.record_match_result(
+                result,
+                action,
+                document_text=document_text,
+                source_type=source_type,
+                split=split,
+                cluster_id=result.phrase.cluster_id,
+            )
+            return action
+
         self._auto_persist()
         return action
 
@@ -165,6 +207,8 @@ class OntologyWriter:
 
         self.bank.promote_cluster(cluster_id, new_label_id)
         self._auto_persist()
+        if self._store is not None:
+            self._store.approve_cluster_examples(cluster_id, new_label_id)
         return True
 
     def auto_promote_all(self, *, skip_constraints: bool = False) -> list[str]:
@@ -188,6 +232,69 @@ class OntologyWriter:
 
     def get_promoted_labels(self) -> dict[str, ProtoLabelCluster]:
         return dict(self.bank.promoted_labels)
+
+    def count_label_examples(
+        self,
+        label_id: str,
+        *,
+        review_status: str = "approved",
+        split: str | None = None,
+    ) -> int:
+        """Count persisted document examples for a label."""
+        if self._store is None:
+            raise RuntimeError("No db_path configured — cannot count label examples")
+        return self._store.count_label_examples(
+            label_id,
+            review_status=review_status,
+            split=split,
+        )
+
+    def get_slow_sync_ready_labels(
+        self,
+        *,
+        min_positive_examples: int = 3,
+        review_status: str = "approved",
+    ) -> list[str]:
+        """Return promoted labels that have enough approved text evidence."""
+        if self._store is None:
+            raise RuntimeError("No db_path configured — cannot inspect training samples")
+        promoted = set(self.bank.promoted_labels.keys())
+        return [
+            label_id
+            for label_id in self._store.get_slow_sync_ready_labels(
+                min_positive_examples=min_positive_examples,
+                review_status=review_status,
+            )
+            if label_id in promoted
+        ]
+
+    def export_ltce_samples(
+        self,
+        *,
+        label_ids: Sequence[str] | None = None,
+        min_positive_examples: int = 1,
+        review_status: str = "approved",
+        promoted_only: bool = True,
+    ) -> list[LtceTextSample]:
+        """Export persisted text evidence as LtceTextSample objects."""
+        if self._store is None:
+            raise RuntimeError("No db_path configured — cannot export LTCE samples")
+
+        selected_label_ids = list(label_ids) if label_ids is not None else None
+        if promoted_only:
+            promoted = set(self.bank.promoted_labels.keys())
+            if selected_label_ids is None:
+                selected_label_ids = sorted(promoted)
+            else:
+                selected_label_ids = [
+                    label_id for label_id in selected_label_ids if label_id in promoted
+                ]
+
+        return self._store.export_ltce_samples(
+            label_ids=selected_label_ids,
+            min_positive_examples=min_positive_examples,
+            review_status=review_status,
+        )
 
     def get_label_inventory(self) -> dict[str, str]:
         """Build {label_id: canonical_text} dict for Discovery's label inventory."""

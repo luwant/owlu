@@ -20,6 +20,7 @@ import pytest
 
 from owlu.common.types import (
     CandidatePhrase,
+    LtceTextSample,
     MatchResult,
     ProtoLabelCluster,
     OWLUConfig,
@@ -61,6 +62,20 @@ def _match(
         decision_reason="test",
         normalized_phrase=text.lower(),
     )
+
+
+def _test_dense_encoder(text: str) -> list[float]:
+    normalized = " ".join(str(text).lower().replace("-", " ").split())
+    groups = {
+        "graph neural network": [1.0, 0.0, 0.0, 0.0],
+        "graph neural networks": [0.99, 0.01, 0.0, 0.0],
+        "graph based neural network": [0.98, 0.02, 0.0, 0.0],
+        "deep learning": [0.0, 1.0, 0.0, 0.0],
+        "deep neural learning": [0.02, 0.98, 0.0, 0.0],
+        "quantum computing": [0.0, 0.0, 1.0, 0.0],
+        "bioinformatics": [0.0, 0.0, 0.0, 1.0],
+    }
+    return groups.get(normalized, [0.2, 0.2, 0.2, 0.2])
 
 
 # =====================================================================
@@ -163,7 +178,10 @@ class TestFourGatePromotion:
 class TestMatchResultRouting:
     def setup_method(self):
         self.bank = LabelBank(min_freq=2, min_source_docs=2,
-                              min_agreement=0.0, min_semantic_distance=0.0)
+                              min_agreement=0.0, min_semantic_distance=0.0,
+                              dense_encoder=_test_dense_encoder,
+                              cluster_merge_threshold=0.80,
+                              cluster_merge_margin=0.01)
         self.bank.register_label("cs.AI", "Artificial Intelligence")
 
     def test_merge_pre_adds_alias(self):
@@ -176,13 +194,17 @@ class TestMatchResultRouting:
         result = _match("quantum computing", "novel_pre", similarity=0.1)
         action = self.bank.process_match_result(result)
         assert action == "hold"  # first occurrence, not enough freq
-        assert "quantum computing" in self.bank.proto_label_clusters
+        assert len(self.bank.proto_label_clusters) == 1
+        cluster = next(iter(self.bank.proto_label_clusters.values()))
+        assert cluster.representative_phrase == "quantum computing"
 
     def test_hold_pre_creates_hold(self):
         result = _match("bioinformatics", "hold_pre", similarity=0.6)
         action = self.bank.process_match_result(result)
         assert action == "hold"
-        assert "bioinformatics" in self.bank.hold_pool
+        assert len(self.bank.hold_pool) == 1
+        cluster = next(iter(self.bank.hold_pool.values()))
+        assert cluster.representative_phrase == "bioinformatics"
 
     def test_discard_action(self):
         result = _match("etc", "discard", similarity=0.0)
@@ -196,7 +218,9 @@ class TestMatchResultRouting:
         self.bank.process_match_result(r1)
         action = self.bank.process_match_result(r2)
         assert action == "candidate"
-        assert "quantum computing" in self.bank.candidate_labels
+        assert len(self.bank.candidate_labels) == 1
+        cluster = next(iter(self.bank.candidate_labels.values()))
+        assert cluster.representative_phrase == "quantum computing"
 
 
 # =====================================================================
@@ -206,7 +230,10 @@ class TestMatchResultRouting:
 class TestClusterAccumulation:
     def setup_method(self):
         self.bank = LabelBank(min_freq=3, min_source_docs=2,
-                              min_agreement=0.5, min_semantic_distance=0.0)
+                              min_agreement=0.5, min_semantic_distance=0.0,
+                              dense_encoder=_test_dense_encoder,
+                              cluster_merge_threshold=0.80,
+                              cluster_merge_margin=0.01)
 
     def test_representative_phrase_by_vote(self):
         """The most frequent surface form wins."""
@@ -214,25 +241,36 @@ class TestClusterAccumulation:
             self.bank._upsert_cluster(_phrase("Deep Learning", "d1"))
         self.bank._upsert_cluster(_phrase("deep learning", "d2"))
 
-        cid = self.bank._cluster_id("Deep Learning")
-        cluster = self.bank.proto_label_clusters[cid]
+        cluster = next(iter(self.bank.proto_label_clusters.values()))
         assert cluster.representative_phrase == "deep learning"
         assert cluster.freq == 4
 
     def test_agreement_aggregation(self):
         self.bank._upsert_cluster(_phrase("NLP", "d1", agreement=0.8))
         self.bank._upsert_cluster(_phrase("NLP", "d2", agreement=0.6))
-        cid = self.bank._cluster_id("NLP")
-        cluster = self.bank.proto_label_clusters[cid]
+        cluster = next(iter(self.bank.proto_label_clusters.values()))
         assert abs(cluster.agreement - 0.7) < 1e-9
 
     def test_source_doc_dedup(self):
         for _ in range(5):
             self.bank._upsert_cluster(_phrase("XAI", "same_doc"))
-        cid = self.bank._cluster_id("XAI")
-        cluster = self.bank.proto_label_clusters[cid]
+        cluster = next(iter(self.bank.proto_label_clusters.values()))
         assert cluster.freq == 5
         assert cluster.source_doc_count == 1  # only 1 unique doc
+
+    def test_semantic_variants_merge_into_same_cluster(self):
+        self.bank._upsert_cluster(_phrase("graph neural network", "d1"))
+        self.bank._upsert_cluster(_phrase("graph neural networks", "d2"))
+        self.bank._upsert_cluster(_phrase("graph-based neural network", "d3"))
+        assert len(self.bank.proto_label_clusters) == 1
+        cluster = next(iter(self.bank.proto_label_clusters.values()))
+        assert cluster.freq == 3
+        assert cluster.source_doc_count == 3
+        assert cluster.representative_phrase in {
+            "graph neural network",
+            "graph neural networks",
+            "graph based neural network",
+        }
 
 
 # =====================================================================
@@ -303,6 +341,9 @@ class TestSQLitePersistence:
             db_path=self._tmpfile,
             min_freq=2, min_source_docs=2,
             min_agreement=0.0, min_semantic_distance=0.0,
+            dense_encoder=_test_dense_encoder,
+            cluster_merge_threshold=0.80,
+            cluster_merge_margin=0.01,
         )
         writer.register_existing_label("cs.AI", "AI")
         r1 = _match("quantum computing", "novel_pre", doc_id="d1", similarity=0.1)
@@ -310,9 +351,9 @@ class TestSQLitePersistence:
         writer.ingest(r1)
         writer.ingest(r2)
 
-        writer2 = OntologyWriter.from_db(self._tmpfile)
-        assert "quantum computing" in writer2.bank.candidate_labels
-        cluster = writer2.bank.candidate_labels["quantum computing"]
+        writer2 = OntologyWriter.from_db(self._tmpfile, dense_encoder=_test_dense_encoder)
+        assert len(writer2.bank.candidate_labels) == 1
+        cluster = next(iter(writer2.bank.candidate_labels.values()))
         assert cluster.freq == 2
         assert cluster.source_doc_count == 2
         writer2._store.close()
@@ -332,6 +373,95 @@ class TestSQLitePersistence:
         assert abs(writer2.bank.min_agreement - 0.7) < 1e-9
         assert abs(writer2.bank.min_semantic_distance - 0.4) < 1e-9
         writer2._store.close()
+        writer._store.close()
+
+    def test_promoted_cluster_round_trip_uses_explicit_mapping(self):
+        writer = OntologyWriter(
+            db_path=self._tmpfile,
+            min_freq=2,
+            min_source_docs=2,
+            min_agreement=0.0,
+            min_semantic_distance=0.0,
+            dense_encoder=_test_dense_encoder,
+            cluster_merge_threshold=0.80,
+            cluster_merge_margin=0.01,
+        )
+        writer.register_existing_label("cs.AI", "Artificial Intelligence")
+        writer.ingest(_match("graph neural network", "novel_pre", doc_id="d1", similarity=0.1))
+        writer.ingest(_match("graph neural networks", "novel_pre", doc_id="d2", similarity=0.1))
+        cluster_id = next(iter(writer.bank.candidate_labels))
+        assert writer.promote(
+            cluster_id,
+            "cs.GNN",
+            skip_constraints=True,
+        ) is True
+
+        writer2 = OntologyWriter.from_db(self._tmpfile, dense_encoder=_test_dense_encoder)
+        promoted = writer2.get_promoted_labels()
+        assert "cs.GNN" in promoted
+        assert promoted["cs.GNN"].cluster_id.startswith("cluster_")
+        writer2._store.close()
+        writer._store.close()
+
+    def test_document_examples_promote_and_export(self):
+        writer = OntologyWriter(
+            db_path=self._tmpfile,
+            min_freq=2,
+            min_source_docs=2,
+            min_agreement=0.0,
+            min_semantic_distance=0.0,
+            dense_encoder=_test_dense_encoder,
+            cluster_merge_threshold=0.80,
+            cluster_merge_margin=0.01,
+        )
+
+        doc_1 = "Graph neural networks are used for molecular property prediction."
+        doc_2 = "This work studies graph neural networks for traffic forecasting."
+
+        r1 = _match("graph neural network", "novel_pre", doc_id="d1", similarity=0.1)
+        r2 = _match("graph neural networks", "novel_pre", doc_id="d2", similarity=0.1)
+
+        assert writer.ingest_with_document(r1, document_text=doc_1) == "hold"
+        assert writer.ingest_with_document(r2, document_text=doc_2) == "candidate"
+
+        cluster_id = next(iter(writer.bank.candidate_labels))
+        assert writer.promote(cluster_id, "cs.GNN", skip_constraints=True) is True
+        assert writer.count_label_examples("cs.GNN") == 2
+        assert writer.get_slow_sync_ready_labels(min_positive_examples=2) == ["cs.GNN"]
+
+        samples = writer.export_ltce_samples(min_positive_examples=2)
+        assert len(samples) == 2
+        assert all(isinstance(sample, LtceTextSample) for sample in samples)
+        assert {sample.doc_id for sample in samples} == {"d1", "d2"}
+        assert all(sample.true_labels == {"cs.GNN"} for sample in samples)
+
+        writer._store.close()
+
+    def test_merge_examples_are_exportable_for_existing_labels(self):
+        writer = OntologyWriter(db_path=self._tmpfile)
+        writer.register_existing_label("cs.AI", "Artificial Intelligence")
+
+        result = _match(
+            "AI research",
+            "merge_pre",
+            doc_id="merge_doc",
+            target_label="cs.AI",
+            similarity=0.95,
+        )
+        writer.ingest_with_document(
+            result,
+            document_text="AI research helps improve planning systems.",
+        )
+
+        assert writer.count_label_examples("cs.AI") == 1
+
+        samples = writer.export_ltce_samples(
+            label_ids=["cs.AI"],
+            min_positive_examples=1,
+            promoted_only=False,
+        )
+        assert len(samples) == 1
+        assert samples[0].true_labels == {"cs.AI"}
         writer._store.close()
 
 

@@ -1,138 +1,87 @@
-# Module 3: Prototype Absorption Module
+# Module 3: Prototype Absorption
 
-> 把已经被闭环体系批准的新标签，真正吸收到 LTCE 表示空间和分类头里。
+> Absorption 负责把 Writer 批准后的标签知识真正写回 LTCE 模型，其中 slow sync 现在已经可以直接消费 Writer 导出的文本样本。
 
 ## 模块定位
 
-Prototype Absorption 是闭环的执行终端。它接收 Writer 晋升后的 `LabelBank`，对 LTCE 模型做两类更新：
+Prototype Absorption 是闭环的执行端，接收：
 
-1. `fast_sync`：标签数不变，只刷新已有标签的语义表示。
-2. `slow_sync`：标签数从 `L` 扩到 `L'`，同时扩展 classifier 输出维度并做增量微调。
+- Writer 产出的 `LabelBank`
+- Writer 导出的 `LtceTextSample`
+- `Label-gen` 的真实 LTCE 运行时
 
-更新后的 `label_embeddings`、`label_prototypes`、`classifier[-1]` 和决策阈值会反馈给 Discovery，形成闭环。
+并完成两类同步：
 
-## 目录结构
+1. `fast_sync`
+   - 标签数不变，只刷新旧标签语义表示
+2. `slow_sync`
+   - 标签数从 `L` 扩到 `L'`
+   - 扩展分类头
+   - 用新标签文本样本做增量训练
+
+---
+
+## 当前目录
 
 ```text
 owlu/absorption/
-├── __init__.py      # PrototypeAbsorption facade
-├── metrics.py       # 向量运算、推断、阈值重标定
-├── fast_sync.py     # fast_sync / fast_sync_model
-├── slow_sync.py     # slow_sync / slow_sync_model
-└── ltce_bridge.py   # 真实 LTCE 运行时加载与 expanded loader 构造
+|-- __init__.py
+|-- metrics.py
+|-- fast_sync.py
+|-- slow_sync.py
+`-- ltce_bridge.py
 ```
 
 ---
 
-## 1. metrics.py
+## 1. fast_sync
 
-`metrics.py` 同时服务 dict 模式和 model 模式：
+`fast_sync` / `fast_sync_model` 解决的是“标签没变，但 alias 和语义描述变了”的场景：
 
-- 纯 Python 工具：
-  `normalize`、`cosine_similarity`、`blend_and_normalize`、`mean_vector`
-- 推断与校准：
-  `score_document`、`infer_topk`、`infer_above_threshold`、`recalibrate_threshold`
-- Torch 工具：
-  `blend_and_normalize_torch`、`recalibrate_model_threshold`
-- 兜底文本编码器：
-  `default_text_encoder(text, dim)`
+- 基于 label alias 文本更新 `label_embeddings`
+- 同步刷新 `label_prototypes`
+- 结合验证集重新标定阈值
 
-`recalibrate_model_threshold` 会直接跑 LTCE `forward()`，基于 `sigmoid(logits)` 做 Macro-F1 grid search。
+这一条路径已经完成 AAPD alias 注入验证。
 
 ---
 
-## 2. fast_sync.py
+## 2. slow_sync
 
-### 2.1 `fast_sync`
+### 2.1 解决的问题
 
-dict 模式，输入是：
+当 Writer 产生新的 promoted label 时，LTCE 原模型并不知道这些标签。`slow_sync_model` 负责：
 
-- `model_state = {label_ids, E, P, threshold}`
-- `label_bank`
-- `validation_set`
-- `text_encoder`
+1. 找出 `label_bank.promoted_labels` 中尚未进入模型的新标签
+2. 初始化新标签的 embedding / prototype
+3. 将分类头从 `L` 维扩到 `L'` 维
+4. 在 expanded label space 上做增量训练
+5. 重新标定阈值
 
-行为：
+### 2.2 这次真正补齐的输入
 
-1. 对每个已有标签收集别名。
-2. 用别名均值向量混合 `E[y]`。
-3. 再用新的 `E[y]` 混合 `P[y]`。
-4. 用验证集重新搜索阈值。
+此前 slow sync 已具备“扩维和训练”的代码骨架，但缺少一条稳定的上游样本供给链路。现在这条链路已经固定为：
 
-### 2.2 `fast_sync_model`
+```text
+Discovery -> Writer.ingest_with_document -> SQLite label_examples
+         -> Writer.promote -> Writer.export_ltce_samples
+         -> build_ltce_incremental_loaders -> slow_sync_model
+```
 
-Torch 原生模式，直接原地修改：
+也就是说，slow sync 现在不再依赖外部临时脚本手工拼装新标签样本。
 
-- `model.label_embeddings`
-- `model.label_prototypes`
+### 2.3 模型契约
 
-如果传入 `validation_loader`，会用真实 LTCE 前向结果做阈值重标定。
-
-这个路径已经在 AAPD alias 注入实验中验证过。
-
----
-
-## 3. slow_sync.py
-
-## 3.1 `slow_sync`
-
-dict 模式原型实现，适合无 Torch 或单元测试场景。
-
-行为：
-
-1. 发现 `label_bank.promoted_labels` 中尚未进入模型的新标签。
-2. 用标签别名文本初始化新标签向量。
-3. 扩展 `label_ids / E / P`。
-4. 用 `training_samples` 做一次轻量更新。
-5. 用验证集重标定阈值。
-
-若没有新标签，会自动回退到 `fast_sync`。
-
-## 3.2 `slow_sync_model`
-
-这条路径现在已经对接真实 LTCE 模型，前提是模型满足 `Label-gen/src/ltce/models/ltce.py` 的真实契约。
-
-### 真实模型契约
-
-`slow_sync_model` 假定模型具备：
+`slow_sync_model` 目前对真实 LTCE 模型的要求是：
 
 - `model.label_embeddings: Tensor[L, H]`
 - `model.label_prototypes: Tensor[L, H]`
 - `model.classifier[-1]: Linear(H, L)`
 - `model.num_labels`
-- `model.forward(input_ids, attention_mask, token_type_ids, sentence_map, labels)`
-- `model.update_prototypes(label_representations, labels)` 可选但推荐
+- `model.forward(...)`
+- 推荐支持 `model.update_prototypes(...)`
 
-这些字段与 `Label-gen/src/ltce/models/ltce.py` 中的 `LTCEModel` 一致。
-
-### 核心行为
-
-`slow_sync_model` 的流程是：
-
-1. 找出新标签 `new_label_ids`
-2. 用标签别名文本初始化新标签语义向量
-3. 扩容：
-   - `label_embeddings: (L, H) -> (L', H)`
-   - `label_prototypes: (L, H) -> (L', H)`
-   - `classifier[-1]: Linear(H, L) -> Linear(H, L')`
-   - `num_labels: L -> L'`
-4. 新标签输出行优先用语义向量初始化，而不是纯随机 Xavier
-5. 旧标签先执行一次 alias 语义混合
-6. 若提供 `training_loader`，按 LTCE 真实 batch 契约做增量微调
-7. 若提供 `validation_loader`，在 expanded label space 上重标定阈值
-
-### 增量微调策略
-
-相比旧版草稿实现，当前 model 模式增加了这些真实训练细节：
-
-- classifier 新行使用 row-wise 学习率缩放
-- 可调用 `model.update_prototypes(...)` 做 prototype EMA
-- 对旧标签 classifier 行加入 anchor regularization，抑制灾难性遗忘
-- 严格校验 `training_loader` / `validation_loader` 的 `labels.shape[1] == L'`
-
-### `training_loader` / `validation_loader` 的要求
-
-它们必须产出与 LTCE 原训练一致的 batch：
+同时，训练和验证 loader 必须输出：
 
 ```python
 {
@@ -144,240 +93,104 @@ dict 模式原型实现，适合无 Torch 或单元测试场景。
 }
 ```
 
-这里最关键的是 `labels` 的列数必须已经扩成新标签空间 `L'`。
-
-如果只有旧的 `(B, L)` 标签矩阵，`slow_sync_model` 会直接报错，而不会静默训练错误维度。
-
-### 注意
-
-`slow_sync_model` 只负责“吸收”与“增量训练”。
-
-它并不会自动凭空生成新标签正例。要真实训练新标签，你仍然需要：
-
-- 新标签的正例文本样本，或
-- 对已有 LTCE 训练/验证文档的新增标签映射
-
-否则它只能完成“扩维 + 语义初始化”，不能学到可靠的新标签分类边界。
+其中最关键的是：`labels.shape[1]` 必须已经扩成 `L'`。如果仍是旧的 `(B, L)`，实现会显式报错，而不是静默错训。
 
 ---
 
-## 4. ltce_bridge.py
+## 3. LTCE Bridge
 
-`ltce_bridge.py` 用来把 OWLU 和 `Label-gen` 下的真实 LTCE 工程接起来。
+`ltce_bridge.py` 的职责是把 OWLU 与 `Label-gen` 工程接起来。
 
-## 4.1 `load_ltce_artifacts`
+### 3.1 `load_ltce_artifacts`
 
-```python
-load_ltce_artifacts(
-    config_path,
-    checkpoint_path=None,
-    label_gen_root=None,
-    device=None,
-    num_workers=0,
-) -> LtceArtifacts
-```
+负责加载：
 
-功能：
+- LTCE config
+- tokenizer
+- dataset builder
+- train / validation / test loader
+- LTCEModel
+- label ids
+- 可选 checkpoint
 
-1. 从 `Label-gen` 动态导入真实 LTCE 模块
-2. 读取 `configs/*.yaml`
-3. 把相对路径改写为 `Label-gen` 根目录下的绝对路径
-4. 构造：
-   - `LtceDatasetBuilder`
-   - tokenizer
-   - train / validation / test dataloader
-   - `LTCEModel`
-5. 加载 label embeddings
-6. 可选加载 checkpoint
+### 3.2 `build_ltce_incremental_loaders`
 
-返回的 `LtceArtifacts` 包含：
+负责：
 
-- `config`
-- `dataset_builder`
-- `tokenizer`
-- `collator`
-- `model`
-- `device`
-- `label_ids`
-- `train_loader`
-- `validation_loader`
-- `test_loader`
+1. 根据 `label_bank.promoted_labels` 计算新增标签
+2. 将 base label space 从 `L` 扩到 `L'`
+3. 对 base 数据集标签向量补零扩维
+4. 接收 Writer 导出的 `LtceTextSample`
+5. 生成 expanded dataloader
 
-## 4.2 `build_ltce_incremental_loaders`
-
-```python
-build_ltce_incremental_loaders(
-    runtime,
-    label_bank,
-    label_ids,
-    promoted_samples=None,
-    train_doc_label_updates=None,
-    validation_doc_label_updates=None,
-    test_doc_label_updates=None,
-    include_base_train=True,
-    include_base_validation=True,
-    include_base_test=False,
-    num_workers=0,
-) -> LtceIncrementalLoaders
-```
-
-功能：
-
-1. 根据 `label_bank.promoted_labels` 计算新标签集合
-2. 把标签空间从 `L` 扩成 `L'`
-3. 对原 LTCE train / val / test 数据集的标签向量补零列
-4. 可选把某些旧文档补充上新标签
-5. 可选追加 `LtceTextSample` 形式的新标签文本样本
-6. 生成新的 expanded dataloader
-
-### `LtceTextSample`
+Writer 导出的样本格式是：
 
 ```python
 LtceTextSample(
-    doc_id: str,
-    text: str,
-    true_labels: set[str],
-    split: Literal["train", "val", "test"] = "train",
+    doc_id="demo_0",
+    text="graph neural networks for traffic forecasting",
+    true_labels={"cs.GNN"},
+    split="train",
 )
 ```
 
-这个结构用于把新标签样本显式注入真实 LTCE 训练管线。
-
 ---
 
-## 5. Facade: PrototypeAbsorption
-
-`PrototypeAbsorption` 现在包含两类入口。
-
-### 5.1 吸收入口
+## 4. 推荐联调用法
 
 ```python
-absorber.fast_absorb(...)
-absorber.slow_absorb(...)
-absorber.fast_absorb_model(...)
-absorber.slow_absorb_model(...)
-```
+from owlu import OntologyWriter, PrototypeAbsorption
 
-其中 `slow_absorb_model(...)` 已经透传：
+writer = OntologyWriter(db_path="owlu_state.db")
 
-- `new_lr`
-- `old_lr`
-- `finetune_epochs`
-- `update_prototypes`
-- `classifier_anchor_weight`
+# 1. 在线写入 discovery 结果和原始文档
+writer.ingest_with_document(result, document_text=doc_text)
 
-### 5.2 LTCE bridge 入口
+# 2. 晋升后直接导出 LTCE 样本
+samples = writer.export_ltce_samples(min_positive_examples=2)
 
-```python
-PrototypeAbsorption.load_ltce_artifacts(...)
-absorber.build_ltce_incremental_loaders(...)
-```
-
-这样可以保持使用方式统一：
-
-1. 先用 facade 加载真实 LTCE 运行时
-2. 再用 facade 基于 `LabelBank` 构造 expanded loader
-3. 最后直接调用 `slow_absorb_model(...)`
-
----
-
-## 6. 推荐真实对接流程
-
-### 6.1 加载 LTCE
-
-```python
-from owlu import LabelBank, PrototypeAbsorption
-
-bank = LabelBank()
-absorber = PrototypeAbsorption(bank)
-
-runtime = PrototypeAbsorption.load_ltce_artifacts(
-    config_path="configs/ltce_aapd_full.yaml",
-    checkpoint_path="outputs/aapd_ablation/aapd_full_seed22/best.pt",
-    label_gen_root="e:/lwt/workspace/Label-gen",
-    device="cuda",
-)
-```
-
-### 6.2 注入新标签样本并构造 expanded loader
-
-```python
-from owlu import LtceTextSample
-
-bank.register_label("cs.NLP", "computational linguistics", aliases=["natural language processing"])
-bank.promoted_labels["cs.NLP"] = object()
-
+# 3. 构造 expanded loader
+absorber = PrototypeAbsorption(writer.bank)
+runtime = PrototypeAbsorption.load_ltce_artifacts(...)
 expanded = absorber.build_ltce_incremental_loaders(
     runtime,
     runtime.label_ids,
-    promoted_samples=[
-        LtceTextSample(
-            doc_id="demo_0",
-            text="this paper studies natural language processing",
-            true_labels={"cs.NLP"},
-            split="train",
-        ),
-    ],
+    promoted_samples=samples,
 )
-```
 
-### 6.3 slow sync 到真实 LTCE
-
-```python
-base_label_ids = list(runtime.label_ids)
-
+# 4. 执行 slow sync
 result = absorber.slow_absorb_model(
     runtime.model,
-    label_ids=base_label_ids,
+    label_ids=list(runtime.label_ids),
     training_loader=expanded.train_loader,
     validation_loader=expanded.validation_loader,
-    current_threshold=0.45,
-    new_lr=5e-5,
-    old_lr=1e-5,
-    finetune_epochs=3,
-    update_prototypes=True,
-    classifier_anchor_weight=0.05,
     device=runtime.device,
 )
 ```
 
-这里要先复制一份原始 `label_ids`，因为 `slow_absorb_model` 会原地 append 新标签名。
+---
+
+## 5. 当前验证范围
+
+本地已验证：
+
+- `build_ltce_incremental_loaders` 能扩张标签空间
+- `slow_sync_model` 会拒绝维度错误的 loader
+- `slow_sync_model` 能在 LTCE 风格 dummy model 上完成扩维与训练
+- `test_discovery_writer_real.py` 已实际跑通真实 API + AAPD + Writer 持久化链路
+
+测试结果：
+
+```text
+python -m pytest owlu/tests/test_absorption_ltce.py -q
+3 passed in 1.88s
+
+python -m pytest owlu/tests -q
+39 passed, 1 warning in 65.53s
+```
 
 ---
 
-## 7. 输入 / 输出契约
+## 6. 当前判断
 
-### 输入
-
-| 来源 | 数据 | 说明 |
-|------|------|------|
-| Writer | `LabelBank` | 含 aliases / descriptions / promoted_labels |
-| LTCE | `LTCEModel` | 真实模型实例 |
-| LTCE | `LtceArtifacts` | 真实 config + tokenizer + dataloaders + model |
-| LTCE | `LtceTextSample` | 新标签训练或验证文本 |
-| LTCE | expanded `DataLoader` | `labels.shape[1] == L'` |
-| Dict mode | `model_state` | `{label_ids, E, P, threshold}` |
-
-### 输出
-
-| 输出 | 说明 |
-|------|------|
-| `threshold` | 新阈值 |
-| `added_labels` | 新增标签 ID |
-| `label_ids` | 更新后的有序标签列表 |
-| `sync_report` | 审计信息 |
-| `model` | model 模式下原地更新后的 LTCE 模型 |
-
----
-
-## 8. 当前验证范围
-
-目前验证到的范围是：
-
-- `fast_sync_model`：AAPD alias 注入实验已验证
-- `slow_sync_model`：已完成真实 LTCE 契约对接
-- `ltce_bridge.py`：已能从 `Label-gen` 加载 AAPD config / checkpoint / dataloader
-- `build_ltce_incremental_loaders`：已能把标签维度从 `54` 扩到 `55` 并生成带新标签列的 batch
-- 单元测试：覆盖 bridge 扩维与 slow sync 关键路径
-
-尚未在仓库内固化的是完整 AAPD slow-sync 指标实验脚本与最终指标表。
+从实现层面看，Absorption 这一段已经不再缺关键接口，尤其是 slow sync 的上游样本供给已固定化。当前剩下的主要不是工程连通性问题，而是实验规模问题：要评估新标签是否真正提升 LTCE 效果，需要持续积累足够多、足够干净的新标签正例文本。
