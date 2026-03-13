@@ -17,6 +17,7 @@ from .common.types import (  # noqa: F401
     LabelInfo,
     ProtoLabelCluster,
     ValidationSample,
+    LtceTextSample,
     Vector,
     Matrix,
     ClusterState,
@@ -39,8 +40,14 @@ from .common.encoder import BertEncoder, SentenceTransformerEncoder  # noqa: F40
 
 # === Module 3: Prototype Absorption ===
 from .absorption import PrototypeAbsorption  # noqa: F401
+from .absorption.ltce_bridge import (  # noqa: F401
+    LtceArtifacts,
+    LtceIncrementalLoaders,
+    build_ltce_incremental_loaders,
+    load_ltce_artifacts,
+)
 from .absorption.fast_sync import fast_sync, fast_sync_model  # noqa: F401
-from .absorption.slow_sync import slow_sync  # noqa: F401
+from .absorption.slow_sync import slow_sync, slow_sync_model  # noqa: F401
 from .absorption.metrics import (  # noqa: F401
     normalize,
     cosine_similarity,
@@ -52,4 +59,3 @@ from .absorption.metrics import (  # noqa: F401
     blend_and_normalize_torch,
     recalibrate_model_threshold,
 )
-

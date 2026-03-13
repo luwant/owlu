@@ -21,6 +21,7 @@ import yaml
 Vector = list[float]
 Matrix = list[Vector]
 ClusterState = Literal["hold", "candidate", "promoted"]
+DatasetSplit = Literal["train", "val", "test"]
 
 
 # ---------------------------------------------------------------------------
@@ -184,3 +185,13 @@ class ValidationSample:
 
     embedding: Vector
     true_labels: set[str]
+
+
+@dataclass(frozen=True)
+class LtceTextSample:
+    """Text sample used for real LTCE incremental absorption."""
+
+    doc_id: str
+    text: str
+    true_labels: set[str]
+    split: DatasetSplit = "train"
